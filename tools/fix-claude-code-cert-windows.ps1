@@ -11,14 +11,16 @@
 
     What this script does:
         1. TLS handshake with api.anthropic.com:443 and prints the certificate ISSUER
-        2. Saves the full certificate chain as PEM to %USERPROFILE%\proxy-ca.pem
+        2. Saves the certificate chain as PEM to %USERPROFILE%\proxy-ca.pem
         3. Sets NODE_EXTRA_CA_CERTS permanently (setx) and for the current session
-        4. Verifies the variable and confirms the cert error is gone
+        4. Tests with Node.js and, if that fails, widens the bundle and retries
+           on its own before asking you to do anything by hand
         5. Prints HTTP_PROXY / HTTPS_PROXY / NO_PROXY
 
     What this script does NOT do:
-        Nothing is deleted or modified. It only creates one .pem file and sets
-        one user environment variable.
+        Nothing is deleted. An existing proxy-ca.pem is backed up and its
+        certificates are kept. It creates one .pem file and sets one user
+        environment variable.
 
     Usage:
         Run in a normal (non-admin) PowerShell window.
@@ -29,6 +31,7 @@
 $ErrorActionPreference = 'Continue'
 $targetHost = 'api.anthropic.com'
 $targetPort = 443
+$testUrl    = "https://$targetHost/v1/models"
 $pemPath    = Join-Path $env:USERPROFILE 'proxy-ca.pem'
 
 # Windows stores that can hold the intercepting CA. Root/AuthRoot hold self-signed
@@ -60,7 +63,7 @@ function Test-UsableCert {
 function Get-PemBlock {
     param([string]$Path)
     $blocks = @()
-    if (-not (Test-Path $Path)) { return $blocks }
+    if ([string]::IsNullOrEmpty($Path) -or -not (Test-Path $Path)) { return $blocks }
     $text = Get-Content -Path $Path -Raw -ErrorAction SilentlyContinue
     if (-not $text) { return $blocks }
     $pattern = [regex]'(?s)-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----'
@@ -115,14 +118,139 @@ function Find-CertBySubject {
     return $null
 }
 
+# Everything Windows itself trusts. Used when the targeted search comes up short:
+# making Node trust what Windows trusts is the whole point of the exercise.
+function Get-AllStoreCert {
+    return @(Get-ChildItem Cert:\LocalMachine\Root, Cert:\CurrentUser\Root, Cert:\LocalMachine\CA `
+                 -ErrorAction SilentlyContinue | Where-Object { Test-UsableCert $_ })
+}
+
+function Find-NodeExe {
+    $found = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) { return $found.Source }
+
+    # VS Code and the Claude Code installer can leave node off the PATH.
+    $candidates = @()
+    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($root) { $candidates += (Join-Path $root 'nodejs\node.exe') }
+    }
+    if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe') }
+    if ($env:APPDATA)      { $candidates += (Join-Path $env:APPDATA 'nvm\node.exe') }
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) { return $candidate }
+    }
+    return $null
+}
+
+# Writes the bundle, carrying over certificates from the file being replaced and
+# from any other bundle NODE_EXTRA_CA_CERTS already points at. A write that would
+# change nothing is skipped entirely, so re-runs do not pile up backups.
+function Save-CaBundle {
+    param($Certs, [string]$Path, [string]$PreviousCaFile)
+
+    $existingBlocks = @(Get-PemBlock -Path $Path)
+
+    $pemLines   = New-Object System.Collections.Generic.List[string]
+    $seenBodies = @()
+    foreach ($cert in $Certs) {
+        $b64 = [Convert]::ToBase64String($cert.RawData)
+        if ($seenBodies -contains $b64) { continue }
+        $seenBodies += $b64
+        $pemLines.Add("# Subject: $($cert.Subject)")
+        $pemLines.Add("# Issuer : $($cert.Issuer)")
+        $pemLines.Add('-----BEGIN CERTIFICATE-----')
+        for ($pos = 0; $pos -lt $b64.Length; $pos += 64) {
+            $pemLines.Add($b64.Substring($pos, [Math]::Min(64, $b64.Length - $pos)))
+        }
+        $pemLines.Add('-----END CERTIFICATE-----')
+        $pemLines.Add('')
+    }
+
+    # An ordered hashtable, not an array of pairs: "+= ,@(a,b)" nests the pair one
+    # level deeper than expected and the inner list comes back empty.
+    $carryOver = [ordered]@{}
+    $carryOver['the previous ' + (Split-Path $Path -Leaf)] = $existingBlocks
+    if ($PreviousCaFile -and $PreviousCaFile -ne $Path -and (Test-Path $PreviousCaFile)) {
+        $carryOver[$PreviousCaFile] = @(Get-PemBlock -Path $PreviousCaFile)
+    }
+
+    foreach ($label in @($carryOver.Keys)) {
+        $carried = 0
+        foreach ($block in @($carryOver[$label])) {
+            if ($seenBodies -notcontains (Get-PemBody $block)) {
+                $seenBodies += (Get-PemBody $block)
+                $pemLines.Add("# Carried over from $label")
+                foreach ($line in ($block -split "`r?`n")) { $pemLines.Add($line) }
+                $pemLines.Add('')
+                $carried++
+            }
+        }
+        if ($carried -gt 0) {
+            Write-Host "  Carried over $carried certificate(s) from $label" -ForegroundColor Green
+        }
+    }
+
+    $existingBodies = @($existingBlocks | ForEach-Object { Get-PemBody $_ } | Sort-Object) -join '|'
+    $newBodies      = @($seenBodies | Sort-Object) -join '|'
+
+    if ((Test-Path $Path) -and $existingBodies -eq $newBodies) {
+        Write-Host '  Bundle already holds exactly these certificates - left untouched.' -ForegroundColor Green
+    } else {
+        # Never destroy an existing bundle: keep a timestamped copy first.
+        if (Test-Path $Path) {
+            $backupPath = "$Path.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+            Copy-Item -Path $Path -Destination $backupPath -Force
+            Write-Host "  Existing file backed up -> $backupPath" -ForegroundColor Yellow
+        }
+        # ASCII, no BOM - OpenSSL/Node reject a BOM at the start of a PEM file.
+        [System.IO.File]::WriteAllLines($Path, $pemLines, (New-Object System.Text.ASCIIEncoding))
+    }
+
+    $pemCerts = @(Get-PemCert -Path $Path)
+    $caCerts  = @($pemCerts | Where-Object { Test-IsCaCert $_ })
+
+    Write-Host "  Saved -> $Path" -ForegroundColor Green
+    Write-Host "  Size  : $((Get-Item $Path).Length) bytes"
+    Write-Host "  Certs : $($pemCerts.Count) ($($caCerts.Count) of them CA certificates)"
+
+    return New-Object PSObject -Property @{
+        Total   = $pemCerts.Count
+        CaCount = $caCerts.Count
+    }
+}
+
+# The decisive test: Claude Code runs on Node, so Node is what has to be happy.
+function Invoke-NodeTlsTest {
+    param([string]$NodeExe, [string]$Url)
+    $js = 'const https=require("https");' +
+          "https.get('$Url',r=>{" +
+          'console.log("  NODE TLS OK   -> HTTP "+r.statusCode+"  (401 expected - certificate problem solved)");' +
+          'process.exit(0)}).on("error",e=>{' +
+          'console.log("  NODE TLS FAIL -> "+(e.code||e.message));process.exit(1)});'
+
+    # Capture node's output instead of letting it fall into the pipeline: it
+    # would be returned alongside the boolean and the caller would get an array,
+    # which is truthy no matter how the test went.
+    $output = & $NodeExe -e $js 2>&1
+    $passed = ($LASTEXITCODE -eq 0)
+    foreach ($line in $output) { Write-Host $line }
+    return $passed
+}
+
 # ---------------------------------------------------------------------------
 Write-Step 1 'TLS handshake -> who is issuing the certificate?'
 # ---------------------------------------------------------------------------
 $chainCerts    = @()
 $leaf          = $null
 $haveIssuingCa = $false
-$haveCa        = $false
 $caCount       = 0
+$totalCount    = 0
+$persistOk     = $false
+$nodeOk        = $false
+$escalated     = $false
+$nodeExe       = Find-NodeExe
+
 try {
     # Add TLS 1.2 rather than replacing whatever is already enabled, so nothing
     # the session had configured is turned off.
@@ -175,9 +303,6 @@ catch {
 }
 
 # --- Assemble the chain -----------------------------------------------------
-# NODE_EXTRA_CA_CERTS needs the CA certificates, not the leaf. A leaf-only PEM
-# looks like it worked but Node still fails with SELF_SIGNED_CERT_IN_CHAIN, so
-# every source below is tried and the result is checked before we call it done.
 if ($leaf) {
     $chainCerts = @($leaf)
 
@@ -228,35 +353,16 @@ if ($leaf) {
         Write-Host ("   [{0}] {1}" -f $i, $chainCerts[$i].Subject)
     }
 
-    # Did we actually capture the CA that signed the leaf? Without it the PEM is useless.
     $haveIssuingCa = @($chainCerts | Where-Object { $_.Subject -eq $leaf.Issuer }).Count -gt 0
 
-    if (-not $haveIssuingCa) {
-        Write-Host ""
-        Write-Host "  !! The issuing CA ($($leaf.Issuer)) was not found on the wire" -ForegroundColor Yellow
-        Write-Host '  !! or in the Windows trust stores. Falling back to exporting every' -ForegroundColor Yellow
-        Write-Host '  !! root Windows already trusts, so Node trusts what Windows trusts.' -ForegroundColor Yellow
-
-        $allRoots = @(
-            Get-ChildItem Cert:\LocalMachine\Root, Cert:\CurrentUser\Root, Cert:\LocalMachine\CA -ErrorAction SilentlyContinue
-        )
-        $known = @($chainCerts | ForEach-Object { $_.Thumbprint })
-        $added = 0
-        foreach ($root in $allRoots) {
-            if (-not (Test-UsableCert $root)) { continue }
-            if ($known -notcontains $root.Thumbprint) {
-                $chainCerts += $root
-                $known += $root.Thumbprint
-                $added++
-            }
-        }
-        Write-Host "  Fallback added $added certificate(s) from the Windows stores." -ForegroundColor Yellow
-
-        # The fallback may well have swept in the CA we were looking for.
-        $haveIssuingCa = @($chainCerts | Where-Object { $_.Subject -eq $leaf.Issuer }).Count -gt 0
-        if ($haveIssuingCa) {
-            Write-Host '  The issuing CA was among them - the bundle should work.' -ForegroundColor Green
-        }
+    # Without Node there is no way to test empirically, so widen the bundle now
+    # rather than shipping one that might be missing the anchor.
+    if (-not $haveIssuingCa -and -not $nodeExe) {
+        Write-Host ''
+        Write-Host '  Issuing CA not found and node is unavailable to test with -' -ForegroundColor Yellow
+        Write-Host '  including every root Windows trusts as a precaution.' -ForegroundColor Yellow
+        $chainCerts += Get-AllStoreCert
+        $escalated = $true
     }
 
     # Final guard so the PEM writer never sees an unusable entry.
@@ -264,108 +370,21 @@ if ($leaf) {
 }
 
 # ---------------------------------------------------------------------------
-Write-Step 2 "Save the certificate chain as PEM"
+Write-Step 2 'Save the certificate chain as PEM'
 # ---------------------------------------------------------------------------
 $previousCaFile = [Environment]::GetEnvironmentVariable('NODE_EXTRA_CA_CERTS', 'User')
 
 if ($chainCerts.Count -eq 0) {
     Write-Host '  No certificates captured - cannot write the PEM file. Stopping here.' -ForegroundColor Red
 } else {
-    # Keep the certificates from any existing bundle - that is what makes the
-    # "export the CA by hand, then re-run" path work.
-    $existingBlocks = @()
-    if (Test-Path $pemPath) {
-        $existingBlocks = @(Get-PemBlock -Path $pemPath)
-    }
-
-    $pemLines = New-Object System.Collections.Generic.List[string]
-    $seenBodies = @()
-    foreach ($cert in $chainCerts) {
-        $b64 = [Convert]::ToBase64String($cert.RawData)
-        $seenBodies += $b64
-        $pemLines.Add("# Subject: $($cert.Subject)")
-        $pemLines.Add("# Issuer : $($cert.Issuer)")
-        $pemLines.Add('-----BEGIN CERTIFICATE-----')
-        for ($pos = 0; $pos -lt $b64.Length; $pos += 64) {
-            $pemLines.Add($b64.Substring($pos, [Math]::Min(64, $b64.Length - $pos)))
-        }
-        $pemLines.Add('-----END CERTIFICATE-----')
-        $pemLines.Add('')
-    }
-
-    # Carry over certificates from (a) the file being replaced, so a hand-exported
-    # CA survives a re-run, and (b) any different bundle NODE_EXTRA_CA_CERTS
-    # already pointed at, so another tool's setup is not silently broken.
-    # An ordered hashtable, not an array of pairs: "+= ,@(a,b)" nests the pair one
-    # level deeper than expected and the inner list comes back empty.
-    $carryOver = [ordered]@{}
-    $carryOver['the previous ' + (Split-Path $pemPath -Leaf)] = $existingBlocks
-    if ($previousCaFile -and $previousCaFile -ne $pemPath -and (Test-Path $previousCaFile)) {
-        $carryOver[$previousCaFile] = @(Get-PemBlock -Path $previousCaFile)
-    }
-
-    foreach ($label in @($carryOver.Keys)) {
-        $carried = 0
-        foreach ($block in @($carryOver[$label])) {
-            if ($seenBodies -notcontains (Get-PemBody $block)) {
-                $seenBodies += (Get-PemBody $block)
-                $pemLines.Add("# Carried over from $label")
-                foreach ($line in ($block -split "`r?`n")) { $pemLines.Add($line) }
-                $pemLines.Add('')
-                $carried++
-            }
-        }
-        if ($carried -gt 0) {
-            Write-Host "  Carried over $carried certificate(s) from $label" -ForegroundColor Green
-        }
-    }
-
-    # A re-run that would change nothing leaves the file completely alone, so
-    # repeated runs do not pile up backups.
-    $existingBodies = @($existingBlocks | ForEach-Object { Get-PemBody $_ } | Sort-Object) -join '|'
-    $newBodies      = @($seenBodies | Sort-Object) -join '|'
-
-    if ((Test-Path $pemPath) -and $existingBodies -eq $newBodies) {
-        Write-Host '  Bundle already holds exactly these certificates - left untouched.' -ForegroundColor Green
-    } else {
-        # Never destroy an existing bundle: keep a timestamped copy first.
-        if (Test-Path $pemPath) {
-            $backupPath = "$pemPath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-            Copy-Item -Path $pemPath -Destination $backupPath -Force
-            Write-Host "  Existing file backed up -> $backupPath" -ForegroundColor Yellow
-        }
-        # ASCII, no BOM - OpenSSL/Node reject a BOM at the start of a PEM file.
-        [System.IO.File]::WriteAllLines($pemPath, $pemLines, (New-Object System.Text.ASCIIEncoding))
-    }
-
-    $pemCerts = @(Get-PemCert -Path $pemPath)
-    $caCount  = @($pemCerts | Where-Object { Test-IsCaCert $_ }).Count
-    $haveCa   = $caCount -gt 0
-
-    Write-Host "  Saved -> $pemPath" -ForegroundColor Green
-    Write-Host "  Size  : $((Get-Item $pemPath).Length) bytes"
-    Write-Host "  Certs : $($pemCerts.Count) ($caCount of them CA certificates)"
-
-    if (-not $haveCa) {
-        Write-Host ""
-        Write-Host '  WARNING: this file contains no CA certificate.' -ForegroundColor Red
-        Write-Host '  NODE_EXTRA_CA_CERTS only accepts CAs, so this will NOT fix the error.' -ForegroundColor Red
-        Write-Host '  Export the CA by hand instead:' -ForegroundColor Red
-        Write-Host '    1. Win+R -> certmgr.msc -> Trusted Root Certification Authorities -> Certificates' -ForegroundColor Red
-        Write-Host "    2. Find the CA named in the ISSUER line above: $(if ($leaf) { $leaf.Issuer })" -ForegroundColor Red
-        Write-Host '    3. Right-click -> All Tasks -> Export -> Base-64 encoded X.509 (.CER)' -ForegroundColor Red
-        Write-Host "    4. Save it over $pemPath and re-run this script" -ForegroundColor Red
-    }
-
-    Write-Host ""
-    Write-Host '  --- head of file ---' -ForegroundColor DarkGray
-    Get-Content $pemPath -TotalCount 6 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    $result     = Save-CaBundle -Certs $chainCerts -Path $pemPath -PreviousCaFile $previousCaFile
+    $caCount    = $result.CaCount
+    $totalCount = $result.Total
 }
 
 # ---------------------------------------------------------------------------
 Write-Step 3 'Set NODE_EXTRA_CA_CERTS (permanent + current session)'
 # ---------------------------------------------------------------------------
-$persistOk = $false
 if (Test-Path $pemPath) {
     if ($previousCaFile) {
         Write-Host "  Previous value : $previousCaFile"
@@ -414,7 +433,7 @@ if (Test-Path $pemPath) {
 }
 
 # ---------------------------------------------------------------------------
-Write-Step 4 'Verify: is the variable set, and is the cert error gone?'
+Write-Step 4 'Verify, and widen the bundle automatically if it is not enough'
 # ---------------------------------------------------------------------------
 Write-Host "  Session  (`$env:) : $env:NODE_EXTRA_CA_CERTS"
 Write-Host "  Persisted (User) : $([Environment]::GetEnvironmentVariable('NODE_EXTRA_CA_CERTS','User'))"
@@ -427,7 +446,7 @@ Write-Host ""
 # passes even before the fix. It tells you whether the network path itself works.
 Write-Host '  [Test A] PowerShell HTTPS request...' -ForegroundColor Cyan
 try {
-    $resp = Invoke-WebRequest -Uri "https://$targetHost/v1/models" -Method GET -TimeoutSec 20 -UseBasicParsing
+    $resp = Invoke-WebRequest -Uri $testUrl -Method GET -TimeoutSec 20 -UseBasicParsing
     Write-Host "  TLS OK - HTTP $($resp.StatusCode)" -ForegroundColor Green
 } catch {
     if ($_.Exception.Response) {
@@ -438,51 +457,54 @@ try {
     }
 }
 
-# Test B - Node.js. This is the one that matters: Claude Code runs on Node.
 Write-Host ""
-Write-Host '  [Test B] Node.js HTTPS request (the real test)...' -ForegroundColor Cyan
-$nodeExe = $null
-$node = Get-Command node -ErrorAction SilentlyContinue
-if ($node) {
-    $nodeExe = $node.Source
-} else {
-    # VS Code and the Claude Code installer can leave node off the PATH.
-    foreach ($candidate in @(
-        (Join-Path $env:ProgramFiles 'nodejs\node.exe')
-        (Join-Path ${env:ProgramFiles(x86)} 'nodejs\node.exe')
-        (Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe')
-        (Join-Path $env:APPDATA 'nvm\node.exe')
-    )) {
-        if ($candidate -and (Test-Path $candidate)) {
-            $nodeExe = $candidate
-            Write-Host "  node was not on PATH - found it at $candidate" -ForegroundColor Yellow
-            break
-        }
-    }
-}
-
-$nodeTestPassed = $false
+Write-Host '  [Test B] Node.js HTTPS request (the decisive one)...' -ForegroundColor Cyan
 if ($nodeExe) {
     Write-Host "  Node : $(& $nodeExe -v)  ($nodeExe)"
-    $js = 'const https=require("https");' +
-          'https.get("https://api.anthropic.com/v1/models",r=>{' +
-          'console.log("  NODE TLS OK   -> HTTP "+r.statusCode+"  (401 expected - certificate problem solved)");' +
-          'process.exit(0)}).on("error",e=>{' +
-          'console.log("  NODE TLS FAIL -> "+(e.code||e.message));process.exit(1)});'
-    & $nodeExe -e $js
-    if ($LASTEXITCODE -eq 0) {
-        $nodeTestPassed = $true
+    $nodeOk = Invoke-NodeTlsTest -NodeExe $nodeExe -Url $testUrl
+
+    # Self-repair: rather than telling you to export the CA by hand, put every
+    # root Windows trusts into the bundle and test again.
+    if (-not $nodeOk -and -not $escalated -and $chainCerts.Count -gt 0) {
+        Write-Host ""
+        Write-Host '  Not enough. Widening the bundle to every root Windows trusts...' -ForegroundColor Yellow
+        $before = $chainCerts.Count
+        $known  = @($chainCerts | ForEach-Object { $_.Thumbprint })
+        foreach ($cert in (Get-AllStoreCert)) {
+            if ($known -notcontains $cert.Thumbprint) {
+                $chainCerts += $cert
+                $known      += $cert.Thumbprint
+            }
+        }
+        $escalated = $true
+        Write-Host "  Added $($chainCerts.Count - $before) certificate(s) from the Windows stores." -ForegroundColor Yellow
+
+        $result     = Save-CaBundle -Certs $chainCerts -Path $pemPath -PreviousCaFile $previousCaFile
+        $caCount    = $result.CaCount
+        $totalCount = $result.Total
+
+        Write-Host ""
+        Write-Host '  Retesting with the widened bundle...' -ForegroundColor Cyan
+        $nodeOk = Invoke-NodeTlsTest -NodeExe $nodeExe -Url $testUrl
+    }
+
+    if ($nodeOk) {
         Write-Host '  >> Certificate issue is FIXED.' -ForegroundColor Green
     } else {
-        Write-Host '  >> Still failing. Two likely causes:' -ForegroundColor Red
-        Write-Host '     - SELF_SIGNED_CERT_IN_CHAIN / UNABLE_TO_GET_ISSUER_CERT_LOCALLY:' -ForegroundColor Red
-        Write-Host '       the PEM is missing the CA. See the manual export steps in STEP 2.' -ForegroundColor Red
-        Write-Host '     - ECONNREFUSED / ETIMEDOUT / 407: a proxy problem, not a certificate' -ForegroundColor Red
-        Write-Host '       problem. Check the variables printed in STEP 5.' -ForegroundColor Red
+        Write-Host ''
+        Write-Host '  >> Could not fix it automatically. What the error code means:' -ForegroundColor Red
+        Write-Host '     SELF_SIGNED_CERT_IN_CHAIN / UNABLE_TO_GET_ISSUER_CERT_LOCALLY' -ForegroundColor Red
+        Write-Host '       The CA is not installed on this machine at all. Export it:' -ForegroundColor Red
+        Write-Host '       certmgr.msc -> Trusted Root Certification Authorities -> Certificates,' -ForegroundColor Red
+        Write-Host "       find $(if ($leaf) { $leaf.Issuer }), right-click ->" -ForegroundColor Red
+        Write-Host '       All Tasks -> Export -> Base-64 encoded X.509, save it over' -ForegroundColor Red
+        Write-Host "       $pemPath and re-run this script." -ForegroundColor Red
+        Write-Host '     ECONNREFUSED / ETIMEDOUT / 407 / ENOTFOUND' -ForegroundColor Red
+        Write-Host '       Not a certificate problem - see the proxy variables in STEP 5.' -ForegroundColor Red
     }
 } else {
     Write-Host '  node not found - skipping Test B. Open a new terminal and run:' -ForegroundColor Yellow
-    Write-Host '    node -e "require(''https'').get(''https://api.anthropic.com/v1/models'',r=>console.log(r.statusCode))"' -ForegroundColor Yellow
+    Write-Host "    node -e `"require('https').get('$testUrl',r=>console.log(r.statusCode))`"" -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------------------
@@ -506,6 +528,7 @@ Write-Host "    ProxyEnable   : $($inet.ProxyEnable)"
 Write-Host "    ProxyServer   : $($inet.ProxyServer)"
 Write-Host "    AutoConfigURL : $($inet.AutoConfigURL)"
 
+# ---------------------------------------------------------------------------
 Write-Host ""
 Write-Host ('=' * 64) -ForegroundColor DarkCyan
 Write-Host ' SUMMARY' -ForegroundColor Cyan
@@ -518,11 +541,11 @@ function Write-Check {
 }
 
 $pemOk = Test-Path $pemPath
-Write-Check $pemOk     'PEM file written             ' $pemPath
-Write-Check $haveCa    'CA certificate(s) in bundle  ' "$caCount found"
-Write-Check $persistOk 'NODE_EXTRA_CA_CERTS persisted'
+Write-Check $pemOk               'PEM file written             ' $pemPath
+Write-Check ($caCount -gt 0)     'CA certificate(s) in bundle  ' "$caCount of $totalCount"
+Write-Check $persistOk           'NODE_EXTRA_CA_CERTS persisted'
 if ($nodeExe) {
-    Write-Check $nodeTestPassed 'Node.js TLS test             '
+    Write-Check $nodeOk          'Node.js TLS test             ' $(if ($escalated) { '(after widening the bundle)' } else { '' })
 } else {
     Write-Host '   [SKIP]  Node.js TLS test              node not found' -ForegroundColor Yellow
 }
@@ -530,7 +553,7 @@ if ($nodeExe) {
 Write-Host ""
 # The Node test is the authoritative one - it exercises exactly what Claude Code
 # does. The other checks only explain a failure when it does not pass.
-$fixed = if ($nodeExe) { $nodeTestPassed } else { $pemOk -and $haveCa }
+$fixed = if ($nodeExe) { $nodeOk } else { $pemOk -and $caCount -gt 0 }
 
 if ($fixed -and $persistOk) {
     Write-Host '   All checks passed.' -ForegroundColor Green

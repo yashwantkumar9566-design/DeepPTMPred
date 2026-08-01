@@ -30,7 +30,10 @@ What it does:
 3. Sets `NODE_EXTRA_CA_CERTS` via `setx` (permanent) and `$env:` (current session).
 4. Verifies the variable and runs both a PowerShell and a Node.js HTTPS request.
    The Node test is the one that matters — `HTTP 401` means the certificate
-   problem is solved (401 just means no API key was sent).
+   problem is solved (401 just means no API key was sent). **If Node still
+   fails, the script repairs itself**: it widens the bundle to every root
+   Windows trusts, rewrites it and tests again, before asking you to do
+   anything by hand.
 5. Prints `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` and the WinINET proxy settings.
 
 It ends with a pass/fail summary:
@@ -59,12 +62,16 @@ is deleted or modified:
 - `setx` is verified by reading the value back, and falls back to the .NET API
   if it did not stick.
 
-### When the CA cannot be found
+### When the first attempt is not enough
 
-If no CA certificate ends up in the bundle, the script says so and prints
-manual `certmgr.msc` export steps instead of leaving behind a PEM that looks
-right but does not work. Save the exported CA over `proxy-ca.pem` and re-run —
-the script keeps what you exported and merges it.
+The targeted chain — the leaf, the intermediates sent during the handshake, and
+the issuers walked up through the Windows trust stores — is tried first. If Node
+still rejects it, the script adds every root Windows trusts, rewrites the bundle
+and retests, so Node ends up trusting exactly what Windows trusts. Only if that
+also fails does it stop and print manual `certmgr.msc` export steps, rather than
+leaving behind a PEM that looks right but does not work. Save the exported CA
+over `proxy-ca.pem` and re-run — the script keeps what you exported and merges
+it.
 
 Note that the CA named in the `ISSUER` line does not itself have to be in the
 bundle. It is often an intermediate sent during the handshake, anchored by a
