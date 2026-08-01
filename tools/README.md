@@ -33,12 +33,42 @@ What it does:
    problem is solved (401 just means no API key was sent).
 5. Prints `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` and the WinINET proxy settings.
 
-It only creates the `.pem` file and sets one user environment variable. Nothing
-is deleted or modified.
+It ends with a pass/fail summary:
 
-If the intercepting CA cannot be found on the wire or in the Windows trust
-stores, the script says so and prints manual `certmgr.msc` export steps rather
-than leaving behind a PEM that looks right but does not work.
+```
+   [ OK ]  PEM file written              C:\Users\you\proxy-ca.pem
+   [ OK ]  CA certificate(s) in bundle   2 found
+   [ OK ]  NODE_EXTRA_CA_CERTS persisted
+   [ OK ]  Node.js TLS test
+```
+
+The Node.js line is the authoritative one — it exercises exactly what Claude
+Code does. The others only explain a failure when it does not pass.
+
+### Safety
+
+It creates the `.pem` file and sets one user environment variable. Nothing else
+is deleted or modified:
+
+- An existing `proxy-ca.pem` is copied to `proxy-ca.pem.bak-<timestamp>` before
+  being rewritten, and its certificates are carried into the new bundle.
+- If `NODE_EXTRA_CA_CERTS` already pointed at a different bundle, those
+  certificates are carried over too, so another tool's setup is not broken.
+- A re-run that would change nothing leaves the file untouched, so repeated
+  runs do not pile up backups.
+- `setx` is verified by reading the value back, and falls back to the .NET API
+  if it did not stick.
+
+### When the CA cannot be found
+
+If no CA certificate ends up in the bundle, the script says so and prints
+manual `certmgr.msc` export steps instead of leaving behind a PEM that looks
+right but does not work. Save the exported CA over `proxy-ca.pem` and re-run —
+the script keeps what you exported and merges it.
+
+Note that the CA named in the `ISSUER` line does not itself have to be in the
+bundle. It is often an intermediate sent during the handshake, anchored by a
+root that is in the bundle; the Node.js test is what settles it.
 
 **After it finishes, close VS Code completely and reopen it.** "Reload Window"
 is not enough — `setx` only reaches newly started processes.
